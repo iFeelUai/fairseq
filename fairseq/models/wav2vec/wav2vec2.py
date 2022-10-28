@@ -233,6 +233,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             dropout=0.0,
             mode=cfg.extractor_mode,
             conv_bias=cfg.conv_bias,
+            num_layers_to_extract=7  # number of layers to extract, features from 7 conv_feature_layers, default=7
         )
 
         self.post_extract_proj = (
@@ -308,7 +309,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
-        self.encoder = TransformerEncoder(cfg)
+        self.encoder = TransformerEncoder(cfg, specific_block=1)  # specific_block for specifying the block to stop extraction in transformer
         self.layer_norm = LayerNorm(self.embed)
 
         self.target_glu = None
@@ -443,10 +444,10 @@ class Wav2Vec2Model(BaseFairseqModel):
 
         return logits
 
-    def forward(self, source, padding_mask=None, mask=True, features_only=False):
-
+    def forward(self, source, padding_mask=None, mask=True, features_only=False, spec_block=1):
+        #  spec_block to specify the block to stop extraction in the transformer
         if self.feature_grad_mult > 0:
-            features = self.feature_extractor(source)
+            features = self.feature_extractor(source, num_layers_to_extract=7)
             if self.feature_grad_mult != 1.0:
                 features = GradMultiply.apply(features, self.feature_grad_mult)
         else:
@@ -499,7 +500,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             y = unmasked_features
             mask_indices = None
 
-        x = self.encoder(x, padding_mask=padding_mask)
+        x = self.encoder(x, padding_mask=padding_mask, specific_block=spec_block)  # passing spec_block to transformer
 
         if features_only:
             return {"x": x, "padding_mask": padding_mask}
@@ -608,6 +609,7 @@ class ConvFeatureExtractionModel(nn.Module):
         dropout: float = 0.0,
         mode: str = "default",
         conv_bias: bool = False,
+        num_layers_to_extract=7
     ):
         super().__init__()
 
@@ -671,19 +673,21 @@ class ConvFeatureExtractionModel(nn.Module):
             )
             in_d = dim
 
-    def forward(self, x):
+    def forward(self, x, num_layers_to_extract):
 
         # BxT -> BxCxT
         x = x.unsqueeze(1)
 
-        for conv in self.conv_layers:
-            x = conv(x)
+        '''for conv in self.conv_layers:
+            x = conv(x)'''
+        for conv_num in range(num_layers_to_extract):
+            x = self.conv_layers[conv_num](x)
 
         return x
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, specific_block=1):  # passing specific_block to transformer
         super().__init__()
 
         self.dropout = args.dropout
@@ -714,7 +718,7 @@ class TransformerEncoder(nn.Module):
                     attention_dropout=args.attention_dropout,
                     activation_dropout=args.activation_dropout,
                     activation_fn=args.activation_fn,
-                    layer_norm_first=args.layer_norm_first,
+                    layer_norm_first=args.layer_norm_first, block_to_stop=1, iteration_num=0  # block_to_stop and iteration_num arguments
                 )
                 for _ in range(args.encoder_layers)
             ]
@@ -726,15 +730,19 @@ class TransformerEncoder(nn.Module):
 
         self.apply(init_bert_params)
 
-    def forward(self, x, padding_mask=None):
-        x = self.extract_features(x, padding_mask)
+    def forward(self, x, specific_block, padding_mask=None):  # passing specific_block to forward
+        x = self.extract_features(x, specific_block, padding_mask)  # passing specific_block to extract_features
 
-        if self.layer_norm_first:
-            x = self.layer_norm(x)
+        '''if self.layer_norm_first:
+            x = self.layer_norm(x)'''
 
+        #if self.layer_norm_first:
+         #   for j in range(len(x)):
+          #      x[j] = self.layer_norm(x[j])
+        
         return x
 
-    def extract_features(self, x, padding_mask=None):
+    def extract_features(self, x, specific_block=1, padding_mask=None):  # passing specific_block argument
 
         if padding_mask is not None:
             x[padding_mask] = 0
@@ -751,17 +759,21 @@ class TransformerEncoder(nn.Module):
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
-        layer_results = []
+        #layer_results = []
         for i, layer in enumerate(self.layers):
-            dropout_probability = np.random.random()
-            if not self.training or (dropout_probability > self.layerdrop):
-                x, z = layer(x, self_attn_padding_mask=padding_mask, need_weights=False)
-                layer_results.append(x)
+            if i<specific_block:  # check to stop at specific_block
+                dropout_probability = np.random.random()
+                if not self.training or (dropout_probability > self.layerdrop):  # pass specific_block and iteration_num to layer
+                    x, z = layer(x, block_to_stop=specific_block, iteration_num=i, self_attn_padding_mask=padding_mask, need_weights=False)
+                    #layer_results.append(x)
 
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
+        #for j in range(len(layer_results)):
+        #    layer_results[j] = layer_results[j].transpose(0, 1)
 
         return x
+        #return layer_results
 
     def max_positions(self):
         """Maximum output length supported by the encoder."""
@@ -788,6 +800,8 @@ class TransformerSentenceEncoderLayer(nn.Module):
         activation_dropout: float = 0.1,
         activation_fn: str = "relu",
         layer_norm_first: bool = False,
+        block_to_stop=1,  # arguments for stop in specific block
+        iteration_num=0
     ) -> None:
 
         super().__init__()
@@ -822,6 +836,8 @@ class TransformerSentenceEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        block_to_stop,  # arguments for stop at specific block
+        iteration_num,
         self_attn_mask: torch.Tensor = None,
         self_attn_padding_mask: torch.Tensor = None,
         need_weights: bool = False,
@@ -843,16 +859,20 @@ class TransformerSentenceEncoderLayer(nn.Module):
                 need_weights=False,
                 attn_mask=self_attn_mask,
             )
-            x = self.dropout1(x)
-            x = residual + x
-
-            residual = x
-            x = self.final_layer_norm(x)
-            x = self.activation_fn(self.fc1(x))
-            x = self.dropout2(x)
-            x = self.fc2(x)
-            x = self.dropout3(x)
-            x = residual + x
+            #print(f'attention of block {iteration_num+1}')  # print to check if stop specific block works
+            if iteration_num<(block_to_stop-1):  # layer to stop in the last block
+                x = self.dropout1(x)
+                x = residual + x
+            
+                residual = x
+                x = self.final_layer_norm(x)
+                x = self.activation_fn(self.fc1(x))
+                x = self.dropout2(x)
+                x = self.fc2(x)
+                #if iteration_num<(block_to_stop-1):  # layer to stop in the last block
+                x = self.dropout3(x)
+                x = residual + x
+                #print(f'layers after attention of block {iteration_num+1}')  # print to check if stop specific block works
         else:
             x, attn = self.self_attn(
                 query=x,
